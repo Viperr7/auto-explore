@@ -599,6 +599,7 @@ class ExplorationState:
             "work_order": self.graph.work_order,
             "work_aliases": self.graph.work_aliases,
             "functional_coverage": self.graph.functional_coverage,
+            "seed_handoff": self.graph.seed_handoff,
             "baseline": self.graph.baseline,
             "state_budgets": {key: getattr(self.config, key) for key in (
                 "max_states_per_page", "max_actions_per_state", "continuous_steps", "max_transition_repeats")},
@@ -682,6 +683,7 @@ class ExplorationState:
         (self.run_dir / "app_graph.json").write_text(encoded, encoding="utf-8")
         if self.work_registry is not None:
             topology = {"schema_version": 1, "identity_contract": "template_state_v1",
+                "seed_handoff": self.graph.seed_handoff,
                 "templates": {page.page_id: page.page_description for page in self.graph.pages.values()},
                 "nodes": [{"id": w.work_id, "template_id": w.page_id, "state": w.normalized_state,
                     "context": w.context, "visual_state_ids": w.observed_state_ids,

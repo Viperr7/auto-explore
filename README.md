@@ -44,6 +44,17 @@ python explore_android_app.py --device 127.0.0.1:PORT_A --package org.tasks \
   --max-steps 3 --no-semantic-dedup --output output/single-task
 ```
 
+结合 STG 评估结果做定向补采（可选，不传这些参数时保持原有探索行为完全不变）：
+
+```bash
+python explore_android_app.py --device 127.0.0.1:PORT_A --package <APP_PACKAGE> \
+  --gym-seed <STG目录>/auto_explore_seed \
+  --repair-clues <评估输出目录>/repair_clues.json \
+  --output output/repair-round
+```
+
+详见 [Gym Explore 种子接续说明](docs/2026-11-11-research-auto-handoff.md) 与 [定点复核补采方案](docs/verify-repair-v1.md)。
+
 ## 目录与结果
 
 ```text

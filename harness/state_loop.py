@@ -193,7 +193,20 @@ class StateExplorer:
                 self.graph.work_queue.remove(work.work_id)
                 self.graph.work_queue.append(work.work_id)
         while self.graph.work_queue:
-            work = self.graph.work_items[self.registry.resolve(self.graph.work_queue.pop(0))]
+            pick_idx = 0
+            if getattr(self.explorer, "repair_clues", None) is not None and len(self.graph.work_queue) > 1:
+                clues = self.explorer.repair_clues
+                def _work_score(wid):
+                    item = self.graph.work_items.get(self.registry.resolve(wid))
+                    page = self.graph.pages.get(item.page_id) if item else None
+                    return clues.activity_priority(page.activity) if page else 0
+                best_score = -1
+                for idx, wid in enumerate(self.graph.work_queue):
+                    sc = _work_score(wid)
+                    if sc > best_score:
+                        best_score = sc
+                        pick_idx = idx
+            work = self.graph.work_items[self.registry.resolve(self.graph.work_queue.pop(pick_idx))]
             candidates = self.registry.candidates(work)
             if not candidates:
                 self.registry.settle(work)
@@ -215,7 +228,7 @@ class StateExplorer:
         if self.current.work:
             self.current.work = self.graph.work_items[self.registry.resolve(self.current.work.work_id)]
 
-    def run(self, root_page, initial_capture):
+    def run(self, root_page, initial_capture, *, seed_routes=()):
         ##这里出现了几个重要的参数 step（执行模型动作，如点击），burst，round
 
         # 1. 用已有的启动截图分析根页面，建立当前视觉状态、状态工作项和空到达路径。
@@ -227,6 +240,9 @@ class StateExplorer:
         # guard 包含状态、上下文和具体值等恢复证据，深拷贝避免随当前状态一起改变。
         # burst 统计当前连续执行了多少步，不是已出队的节点数。
         self.graph.baseline = deepcopy(self.current.guard)
+        if seed_routes:
+            from .gym_seed import bootstrap
+            bootstrap(self, seed_routes)
         burst = 0
 
         # 3. 在总步数预算内循环；每轮最多执行一个被选中的候选动作。
@@ -301,9 +317,10 @@ class StateExplorer:
         statuses = {w.status for w in self.graph.work_items.values()}
         page_limited = (self.graph.termination_reason == "budget_limited" or
                         any(page.exploration_status == "budget_limited" for page in self.graph.pages.values()))
+        page_blocked = any(page.exploration_status == "blocked" for page in self.graph.pages.values())
         self.graph.termination_reason = ("blocked" if self.app_return_failed else
                                          "budget_limited" if "budget_limited" in statuses or page_limited else
-                                         "blocked" if statuses - {"complete", "merged"} else "frontier_exhausted")
+                                         "blocked" if statuses - {"complete", "merged"} or page_blocked else "frontier_exhausted")
 
         # 7. 保存结算后的状态，再处理本轮功能目录总结并清空轮次页面集合。
         # 外层 AndroidExplorer.explore() 的 finally 还会执行最终总结和最终保存。

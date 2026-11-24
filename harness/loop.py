@@ -61,7 +61,14 @@ class AndroidExplorer:
         if config.summary_model.strip() and model_identity(execution_model) == model_identity(config.summary_model):
             raise ValueError("Experience summary model must differ from the actual execution model")
         self.state = state or ExplorationState(config)
-        self.memory_planner = MemoryGuidedPlanner(self.memory, self.state, self.analyzer)
+        self.repair_clues = None
+        if config.repair_clues:
+            from .repair_clues import load_repair_clues
+            self.repair_clues = load_repair_clues(config.repair_clues, config.app_package)
+            print(f"[Repair Clues] 已加载 {len(self.repair_clues.targets)} 条评估补采线索：{self.repair_clues.source}")
+        self.memory_planner = MemoryGuidedPlanner(
+            self.memory, self.state, self.analyzer, repair_clues=self.repair_clues,
+        )
         # One automatic summary pipeline; optional node/replica products are explicit consumers.
         self.capability_service = AppCapabilityCatalog(config, self.state, summary_client)
         self.state.capability_service = self.memory.capability_service = self.capability_service
@@ -133,6 +140,17 @@ class AndroidExplorer:
 
         # 1. 初始化本轮计时，并说明是否启用了独立总结模型。
         # start_time 用于统计探索耗时，以及包含结束处理的总耗时。
+        seed_routes = ()
+        if self.config.gym_seed:
+            from .gym_seed import load_seed_routes
+            seed_routes = load_seed_routes(self.config.gym_seed, self.config.app_package,
+                                           max_depth=min(self.config.max_depth, self.config.max_replay_steps))
+            self.graph.seed_handoff = {**seed_routes.report, "attempted_routes": 0,
+                "executed_actions": 0, "verified_arrivals": 0,
+                "verification_mode": self.config.gym_seed_verification, "runtime_rejections": {}}
+            print(f"[Gym seed] {len(seed_routes)} candidate routes; only live-verified states join the queue")
+            if seed_routes.report["rejections"]:
+                print(f"[Gym seed] Historical prefix filters: {seed_routes.report['rejections']}")
         start_time = time.monotonic()
         if self.capability_service.client:
             print(f"[Summary] 执行模型：{self.config.model}；独立总结模型：{self.config.summary_model}")
@@ -154,7 +172,7 @@ class AndroidExplorer:
             # 此处 return 仍会执行本函数的 finally，保存结果并处理剩余总结。
             if self.config.state_exploration:
                 from .state_loop import StateExplorer
-                StateExplorer(self).run(root_page, initial_capture)
+                StateExplorer(self).run(root_page, initial_capture, seed_routes=seed_routes)
                 ##这里要注意，默认是执行StateExplorer(self).run()的
                 return
 

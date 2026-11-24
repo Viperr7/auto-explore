@@ -51,6 +51,9 @@ class ExplorerConfig:
     max_actions_per_page: int = 0
     max_steps: int = 0  # Zero preserves the original unlimited action budget.
     state_exploration: bool = True
+    gym_seed: str = ""
+    gym_seed_verification: str = "adaptive"
+    repair_clues: str = ""
     max_states_per_page: int = 16
     max_actions_per_state: int = 20
     continuous_steps: int = 4

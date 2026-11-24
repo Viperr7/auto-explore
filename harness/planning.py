@@ -16,10 +16,12 @@ from .metrics import timed_phase
 
 
 class MemoryGuidedPlanner:
-    def __init__(self, memory: GraphMemory, state: ExplorationState, analyzer: Any):
+    def __init__(self, memory: GraphMemory, state: ExplorationState, analyzer: Any,
+                 repair_clues: Any = None):
         self.memory = memory
         self.state = state
         self.analyzer = analyzer
+        self.repair_clues = repair_clues
         self.state.memory_sources = list(memory.sources)
         self.state.historical_observations = list(memory.observations)
 
@@ -51,6 +53,17 @@ class MemoryGuidedPlanner:
             }}
             if self.state.work_registry is not None:
                 context["node_exploration_summary"] = self.state.work_registry.exploration_summary(work)
+        clue_scores: dict[int, int] = {}
+        clue_matches: dict[int, list[str]] = {}
+        if self.repair_clues is not None:
+            context = {**context, "repair_clues": self.repair_clues.prompt_context(
+                page.activity, page.page_description, actions[start:],
+            )}
+            for index in range(start, len(actions)):
+                sc, ms = self.repair_clues.match_action(page.activity, actions[index])
+                if sc > 0:
+                    clue_scores[index] = sc
+                    clue_matches[index] = ms
         candidates = [{
             "action_index": index, "action_type": action.action_type,
             "target_description": action.target_description, "element_text": action.element_text,
@@ -63,6 +76,8 @@ class MemoryGuidedPlanner:
             "input_mode": action.input_mode, "field_key": action.field_key,
             "control_key": action.control_key, "effect_kind": action.effect_kind,
             "intent": action.intent, "relevant_state_keys": action.relevant_state_keys,
+            **({"repair_clue_score": clue_scores[index], "repair_clue_matches": clue_matches[index]}
+               if index in clue_scores else {}),
         } for index, action in enumerate(actions) if index >= start]
         record = {
             "phase": "select_action", "step": self.state.graph.completed_steps,
@@ -111,9 +126,12 @@ class MemoryGuidedPlanner:
             usable = [index for index in range(start, len(actions))
                       if actions[index].action_type != "input" or actions[index].input_mode == "clear"
                       or usable_input(actions[index].input_text)]
-            # Prefer fresh branches on model failure; never exclude a target based on memory.
+            # Prefer fresh branches (and repair-clue matches first) on model failure;
+            # never exclude a target based on memory or clues.
             usable.sort(key=lambda index: (
-                checklist.get(action_key(actions[index]), {}).get("attempts", 0), index,
+                checklist.get(action_key(actions[index]), {}).get("attempts", 0),
+                -clue_scores.get(index, 0),
+                index,
             ))
             if usable:
                 index = usable[0]

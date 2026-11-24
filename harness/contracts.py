@@ -212,6 +212,7 @@ class AppGraph:
     work_order: List[str] = field(default_factory=list)
     work_aliases: Dict[str, str] = field(default_factory=dict)
     functional_coverage: Dict[str, dict] = field(default_factory=dict)
+    seed_handoff: Dict[str, object] = field(default_factory=dict)
     baseline: Dict[str, object] = field(default_factory=dict)
     termination_reason: str = "running"
     timings: Dict[str, float] = field(default_factory=dict)

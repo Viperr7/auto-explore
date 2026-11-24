@@ -55,6 +55,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="作为只读记忆的同 App app_graph.json，可重复指定；默认读取输出目录中的旧图")
     parser.add_argument("--no-graph-memory", action="store_true", help="关闭图谱记忆和自动验证重试，保留当前截图动作选择与定位")
     parser.add_argument("--page-exploration", action="store_true", help="使用旧页面队列；默认按状态探索")
+    parser.add_argument("--gym-seed", default="", help="Gym Explore 种子包或包含 auto_explore_seed 的 App 输出目录")
+    parser.add_argument("--repair-clues", default="", help="STG 评估生成的 repair_clues.json，引导新一轮探索优先补采缺口控件与未覆盖页面")
+    parser.add_argument("--repair-plan", help="只运行经独立复核的定点补采任务，不启动常规探索或模型")
+    parser.add_argument("--repair-environment", help="补采计划绑定的测试环境标识")
+    parser.add_argument("--gym-seed-verification", choices=("adaptive", "exact"), default="adaptive",
+                        help="种子到达核验：adaptive=精确快路径+模型核验/当前控件重定位；exact=仅精确像素")
     parser.add_argument("--max-states-per-page", type=int, default=ExplorerConfig.max_states_per_page,
                         help="每页最多展开的状态工作项数量")
     parser.add_argument("--max-actions-per-state", type=int, default=ExplorerConfig.max_actions_per_state,
@@ -130,6 +136,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def config_from_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> ExplorerConfig:
+    if args.gym_seed and args.page_exploration:
+        parser.error("--gym-seed requires state exploration (omit --page-exploration)")
     if not args.device.strip():
         parser.error("请通过 --device 或 ANDROID_SERIAL 指定云沙箱的 ADB serial")
     if args.max_pages < 1:
@@ -182,6 +190,9 @@ def config_from_args(args: argparse.Namespace, parser: argparse.ArgumentParser) 
         app_activity=args.activity,
         max_pages=args.max_pages,
         state_exploration=not args.page_exploration,
+        gym_seed=args.gym_seed,
+        gym_seed_verification=args.gym_seed_verification,
+        repair_clues=args.repair_clues,
         max_states_per_page=args.max_states_per_page,
         max_actions_per_state=args.max_actions_per_state,
         continuous_steps=args.continuous_steps,
@@ -232,8 +243,32 @@ def config_from_args(args: argparse.Namespace, parser: argparse.ArgumentParser) 
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
+    import sys
+    from pathlib import Path
+
     parser = build_parser()
+    argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(argv)
+    if args.repair_plan:
+        if args.page_exploration or args.gym_seed or args.repair_clues or args.memory_graph or args.log_file or args.activity:
+            parser.error("补采不得混用页面模式、Gym种子、补采线索、历史记忆、外部日志或自定义启动Activity")
+        if (not args.repair_environment or not any(v == "--output" or v.startswith("--output=") for v in argv)
+                or not any(v == "--device" or v.startswith("--device=") for v in argv)):
+            parser.error("--repair-plan requires explicit --device, --repair-environment and new --output")
+        from .repair_runner import AdbRepairDevice, run_repairs
+        try:
+            result = run_repairs(Path(args.repair_plan), Path(args.output), args.package, args.repair_environment,
+                                 lambda budget: AdbRepairDevice(args.adb, args.device, args.package, budget,
+                                                                delay=args.screenshot_delay))
+        except (KeyError, TypeError, ValueError, OSError) as exc:
+            parser.error(str(exc))
+        print(f"[Repair] {result['termination']}; device_actions={result['device_actions']}; "
+              f"{Path(args.output) / 'repair_results.json'}")
+        if result["termination"] not in {"completed", "no_executable_jobs"}:
+            raise SystemExit(2)
+        return
+    if args.repair_environment:
+        parser.error("--repair-environment requires --repair-plan")
     with capture_terminal_output(args.output, args.log_file):
         config = config_from_args(args, parser)
         AndroidExplorer(config).explore()
