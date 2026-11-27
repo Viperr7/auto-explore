@@ -121,16 +121,21 @@ class VLMAnalyzer:
                 "或通过 --api-key 传入。"
             )
         try:
-            from openai import OpenAI
+            from openai import DefaultHttpxClient, OpenAI
         except ImportError as exc:  # pragma: no cover
             raise SystemExit("缺少依赖 openai，请先运行：pip install openai pillow") from exc
 
         self.config = config
-        self.client = OpenAI(
-            base_url=config.vlm_base_url,
-            api_key=config.vlm_api_key,
-            timeout=config.vlm_timeout,
-        )
+        client_kwargs: Dict[str, Any] = {
+            "base_url": config.vlm_base_url,
+            "api_key": config.vlm_api_key,
+            "timeout": config.vlm_timeout,
+            "max_retries": 1,
+        }
+        base_lower = str(config.vlm_base_url or "").casefold()
+        if "127.0.0.1" in base_lower or "localhost" in base_lower or "[::1]" in base_lower:
+            client_kwargs["http_client"] = DefaultHttpxClient(trust_env=False)
+        self.client = OpenAI(**client_kwargs)
         self.model = config.model
         self.request_options = chat_request_options(
             self.model, profile=config.model_api_profile,
@@ -159,7 +164,38 @@ class VLMAnalyzer:
             PAGE_DESCRIPTION_PROMPT, [("current screen", image_b64)], max_tokens=1024,
         )
 
+    @staticmethod
+    def _local_ngram_embedding(description: str, dims: int = 256) -> List[float]:
+        """Deterministic zero-dependency feature-hashing vector for short screen labels."""
+        import hashlib
+        text = re.sub(r"\s+", " ", str(description or "").strip().casefold())
+        words = re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]", text)
+        features: List[str] = []
+        for w in words:
+            features.append(f"w:{w}")
+            if len(w) >= 3:
+                for i in range(len(w) - 2):
+                    features.append(f"c:{w[i:i + 3]}")
+        for a, b in zip(words, words[1:]):
+            features.append(f"b:{a}_{b}")
+        if not features:
+            features = [f"raw:{text or 'empty'}"]
+        vec = [0.0] * dims
+        for feat in features:
+            digest = hashlib.blake2b(feat.encode("utf-8"), digest_size=8).digest()
+            idx = int.from_bytes(digest[:4], "little") % dims
+            sign = 1.0 if (digest[4] & 1) else -1.0
+            weight = 2.0 if feat.startswith("w:") else 1.5 if feat.startswith("b:") else 0.7
+            vec[idx] += sign * weight
+        norm = math.hypot(*vec)
+        if norm <= 0:
+            vec[0] = 1.0
+            return vec
+        return [v / norm for v in vec]
+
     def embed_description(self, description: str) -> List[float]:
+        if str(self.config.embedding_model or "").strip().casefold() == "local-ngram":
+            return self._local_ngram_embedding(description)
         if self.embedding_client is None:
             from openai import OpenAI
 
@@ -206,6 +242,17 @@ class VLMAnalyzer:
         image_b64, sent_size = self._prepare_image_for_model(screenshot_b64, screen_size)
         prompt = (self.context_builder.screen_analysis_prompt(*sent_size) if memory is None
                   else self.context_builder.screen_analysis_prompt(*sent_size, memory=memory))
+        if memory and isinstance(memory.get("repair_clues_guidance"), str) and memory["repair_clues_guidance"].strip():
+            prompt += "\n" + memory["repair_clues_guidance"].strip()
+        if self.config.max_actions_per_page > 0:
+            prompt += (
+                f"\nCONCISENESS BUDGET: Return AT MOST {self.config.max_actions_per_page} "
+                "highest-priority distinct interactive elements/actions. ALWAYS include ALL visible "
+                "bottom navigation tabs and top-level module/search/profile/settings/compose entries "
+                "BEFORE repeated feed/list/meal rows; pick AT MOST ONE representative from homogeneous "
+                "repeating groups (e.g. meal slots, feed cards, sibling category chips), and keep "
+                "descriptions concise (<= 12 words) so the full JSON completes cleanly."
+            )
         try:
             images = [("current screen", image_b64)]
             if reference is not None and history is not None:
@@ -682,7 +729,17 @@ class AndroidController:
         output = self._adb("shell", "am", "start", "-n", component, *flags)
         if "error" in output.casefold():
             raise RuntimeError(f"Target Activity launch failed: {output.strip()}")
-        time.sleep(2)
+        time.sleep(max(0.0, float(getattr(self.config, "launch_delay", 2.0))))
+        self._dismiss_system_launch_dialogs()
+
+    def _dismiss_system_launch_dialogs(self, max_attempts: int = 2) -> None:
+        """Dismiss transient Android 14/15 OS dialogs (e.g. LogAccessDialogActivity) blocking launch."""
+        for _ in range(max_attempts):
+            current = self.get_current_activity()
+            if "LogAccessDialogActivity" not in current:
+                break
+            self.go_back()
+            time.sleep(1.0)
 
     def restart_app(self) -> None:
         self._adb("shell", "am", "force-stop", self.config.app_package)
@@ -704,6 +761,28 @@ class AndroidController:
             ),
             screen_size,
         )
+
+    def capture_hierarchy(self) -> str:
+        """Best-effort native UIAutomator hierarchy XML; never blocks exploration."""
+        def _extract(raw: bytes) -> str:
+            start = raw.find(b"<hierarchy")
+            end = raw.rfind(b"</hierarchy>")
+            if start >= 0 and end > start:
+                return raw[start:end + len(b"</hierarchy>")].decode("utf-8", errors="replace")
+            return ""
+
+        try:
+            xml = _extract(self._adb_bytes("exec-out", "uiautomator", "dump", "/dev/tty"))
+            if xml:
+                return xml
+        except Exception:
+            pass
+        try:
+            remote = "/sdcard/window_dump.xml"
+            self._adb("shell", "uiautomator", "dump", remote, check=False)
+            return _extract(self._adb_bytes("exec-out", "cat", remote))
+        except Exception:
+            return ""
 
     def get_current_activity(self) -> str:
         # Task membership is not foreground ownership: a browser can share the

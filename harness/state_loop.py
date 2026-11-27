@@ -99,6 +99,21 @@ class StateExplorer:
                                            workflow_id=workflow_id, vlm_verified=vlm_verified)
         if work is not None:
             self.graph.exploration_order.append(page.page_id)
+        clues = getattr(self.explorer, "repair_clues", None)
+        if clues is not None and callable(getattr(clues, "mark_observed", None)):
+            newly_hit = clues.mark_observed(
+                profile.get("activity", ""),
+                page_description=page.page_description,
+                content_hints=page.content_hints,
+            )
+            if newly_hit:
+                self.state.append_observation({
+                    "kind": "repair_clue_hit",
+                    "page_id": page.page_id,
+                    "activity": profile.get("activity", ""),
+                    "targets": newly_hit,
+                    "progress": clues.progress(),
+                })
         return Position(page, visual, work, capture, profile, path)
 
     @timed_phase("recovery_seconds")
@@ -406,14 +421,22 @@ class StateExplorer:
         except Exception as exc:
             error = str(exc)
         finally:
+            before_xml = after_xml = ""
             if self.config.save_screenshots:
                 before_path, saved_after = self.explorer._save_transition_screens(before.capture, capture or before.capture)
                 after_path = saved_after if observation_valid else ""
+                save_xml = getattr(self.explorer, "_save_transition_hierarchies", None)
+                if callable(save_xml):
+                    before_xml, after_xml = save_xml(before.capture, capture or before.capture, before_path, after_path)
             target = after.work if after else None
+            visual_changed = bool(observation_valid and capture is not None
+                                  and capture.screenshot_hash != before.capture.screenshot_hash)
             observation = self.state.record_transition(
                 from_page=before.page.page_id, to_page=after.page.page_id if after else "",
                 action=action, success=executed, state_changed=bool(after and behavioral_changes(before.guard, after.guard)),
                 before_screenshot=before_path, after_screenshot=after_path, recovery="continued" if after else "pending_recovery",
+                before_hierarchy_path=before_xml, after_hierarchy_path=after_xml,
+                visual_changed=visual_changed,
                 observation_valid=observation_valid, destination_verified=after is not None,
                 error_stage=stage, error=error, outside_app=outside,
                 external_activity=external_activity,

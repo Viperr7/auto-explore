@@ -201,6 +201,10 @@ class ExplorationContextBuilder:
             "node_exploration_summary describes observed common/state-specific operations and failures. "
             "Prefer uncovered functions under current conditions. Missing/truncated history is not coverage; "
             "offered covered controls are for bounded navigation only.\n"
+            "When memory.repair_clues is present, prioritize untried safe actions that carry repair_clue_score / "
+            "repair_clue_matches or visibly lead toward repair_clues.activity_clues or repair_clues.top_missing_screens, "
+            "and deprioritize actions marked repair_clue_avoid (already covered in baseline) unless needed to reach an "
+            "uncovered core module, while never guessing hidden targets.\n"
             "Pending actions:\n" + json.dumps(candidates, ensure_ascii=False)
             + ExplorationContextBuilder.memory_instructions(memory)
         )

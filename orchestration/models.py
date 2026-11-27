@@ -13,6 +13,7 @@ from typing import Any
 OPTION_TYPES = {
     "activity": str, "model": str, "summary_model": str, "embedding_model": str,
     "memory_scope": str,
+    "gym_seed": str, "gym_seed_verification": str, "repair_clues": str,
     "max_steps": int, "max_pages": int, "max_depth": int,
     "max_states_per_page": int, "max_actions_per_state": int,
     "continuous_steps": int, "max_replay_steps": int,
@@ -78,6 +79,10 @@ class TaskSpec:
             if name in {"max_pages", "max_states_per_page", "max_actions_per_state", "continuous_steps",
                         "max_replay_steps", "coverage_checkpoint_top_k", "summary_timeout", "embedding_timeout"} and value <= 0:
                 raise ValueError(f"{name} must be positive")
+            if name == "gym_seed_verification" and value not in {"adaptive", "exact"}:
+                raise ValueError("gym_seed_verification must be 'adaptive' or 'exact'")
+        if options.get("gym_seed") and options.get("page_exploration"):
+            raise ValueError("gym_seed requires state exploration (page_exploration must be false)")
         object.__setattr__(self, "options", options)
         object.__setattr__(self, "devices", tuple(dict.fromkeys(self.devices)))
 

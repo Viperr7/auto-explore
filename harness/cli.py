@@ -43,6 +43,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="截图前等待时间（秒）",
     )
     parser.add_argument(
+        "--launch-delay",
+        type=float,
+        default=ExplorerConfig.launch_delay,
+        help="冷启动/重启 App 后额外等待时间（秒），用于跳过商业 App 开屏页",
+    )
+    parser.add_argument(
+        "--vlm-timeout",
+        type=float,
+        default=ExplorerConfig.vlm_timeout,
+        help="VLM 单次请求超时秒数",
+    )
+    parser.add_argument(
         "--replay-attempts",
         type=int,
         default=ExplorerConfig.replay_attempts,
@@ -165,6 +177,10 @@ def config_from_args(args: argparse.Namespace, parser: argparse.ArgumentParser) 
         parser.error("--max-actions-per-page 不能小于 0")
     if args.screenshot_delay < 0:
         parser.error("--screenshot-delay 不能小于 0")
+    if args.launch_delay < 0:
+        parser.error("--launch-delay 不能小于 0")
+    if not math.isfinite(args.vlm_timeout) or args.vlm_timeout <= 0:
+        parser.error("--vlm-timeout 必须为有限正数")
     if args.replay_attempts < 1:
         parser.error("--replay-attempts 必须大于 0")
     if args.vlm_max_image_side < QWEN_RESIZE_FACTOR:
@@ -205,6 +221,7 @@ def config_from_args(args: argparse.Namespace, parser: argparse.ArgumentParser) 
         max_depth=args.max_depth,
         max_actions_per_page=args.max_actions_per_page,
         screenshot_delay=args.screenshot_delay,
+        launch_delay=args.launch_delay,
         replay_attempts=args.replay_attempts,
         back_after_action=not args.no_back,
         output_dir=args.output,
@@ -217,6 +234,7 @@ def config_from_args(args: argparse.Namespace, parser: argparse.ArgumentParser) 
         vlm_base_url=args.base_url,
         vlm_api_key=args.api_key,
         model=args.model,
+        vlm_timeout=args.vlm_timeout,
         summary_model=args.summary_model.strip(),
         summary_timeout=args.summary_timeout,
         summary_max_chars=args.summary_max_chars,

@@ -106,6 +106,7 @@ class PageVisualState:
     behavioral_state: Optional[Dict[str, object]] = None
     context: Dict[str, object] = field(default_factory=dict)
     entry_routes: List[List[ActionSequenceStep]] = field(default_factory=list)
+    hierarchy_path: str = ""
 
 
 @dataclass
@@ -137,6 +138,7 @@ class PageState:
     representative_state_id: str = ""
     states: Dict[str, PageVisualState] = field(default_factory=dict)
     control_aliases: Dict[str, str] = field(default_factory=dict)
+    hierarchy_path: str = ""
 
 
 @dataclass
@@ -162,6 +164,10 @@ class Transition:
     from_work_id: str = ""
     to_work_id: str = ""
     purpose: str = "exploration"
+    edge_id: str = ""
+    before_hierarchy_path: str = ""
+    after_hierarchy_path: str = ""
+    visual_changed: Optional[bool] = None
 
 
 @dataclass
@@ -223,6 +229,7 @@ class ScreenCapture:
     image_b64: str
     screenshot_hash: str
     screen_size: Tuple[int, int]
+    hierarchy_xml: str = field(default="", compare=False, repr=False)
 
 
 @dataclass(frozen=True)

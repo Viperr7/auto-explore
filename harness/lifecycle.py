@@ -41,7 +41,14 @@ class ExplorationLifecycle:
 
     def capture_screen(self) -> ScreenCapture:
         screenshot_b64, screenshot_hash, screen_size = self.controller.capture_screenshot()
-        return ScreenCapture(screenshot_b64, screenshot_hash, screen_size)
+        capture_xml = getattr(self.controller, "capture_hierarchy", None)
+        hierarchy_xml = capture_xml() if callable(capture_xml) else ""
+        return ScreenCapture(
+            screenshot_b64,
+            screenshot_hash,
+            screen_size,
+            hierarchy_xml=hierarchy_xml if isinstance(hierarchy_xml, str) else "",
+        )
 
     def return_to_target_app(self) -> bool:
         """Leave external screens without exploring them; recovery is globally bounded."""

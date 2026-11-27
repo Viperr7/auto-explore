@@ -53,8 +53,29 @@ def candidate_id(row: dict) -> str:
     return sha(json.dumps(key, ensure_ascii=False, sort_keys=True).encode())[:24]
 
 
+def _default_research_root() -> Path:
+    parent = Path(__file__).resolve().parents[2]
+    eval_branch = parent / "research-explore-eval-branch"
+    return eval_branch if eval_branch.is_dir() else parent / "research-explore"
+
+
 def candidates(report: dict, gaps: list) -> dict:
-    rows = [r for r in report["findings"] if r["type"] not in {k+"_control" for k in CONTROL_TYPES - {"inconsistent_control"}}]
+    ft_canon = ((report.get("coverage") or {}).get("functional_templates") or {}).get("canonical") or {}
+    core_block = ft_canon.get("core") or {}
+    core_missing = {
+        m for t in (core_block.get("templates") or [])
+        if not t.get("covered") for m in (t.get("members") or [])
+    }
+    aux_excluded = {e.get("screen") for e in (ft_canon.get("excluded") or []) if e.get("screen")}
+    rows = []
+    for r in report["findings"]:
+        if r["type"] in {k + "_control" for k in CONTROL_TYPES - {"inconsistent_control"}}:
+            continue
+        if r["type"] == "missing_screen" and core_block:
+            if r.get("screen") in aux_excluded:
+                continue
+            r = {**r, "canonical_core": r.get("screen") in core_missing}
+        rows.append(r)
     rows += [{**gap, "type": gap["status"]} for gap in gaps]
     return {candidate_id(r): r for r in rows}
 
@@ -211,13 +232,14 @@ def compile_plan(stg_path, report_path, gaps_path, version_path, environment, *,
                     raise ValueError("already_covered_edge")
                 key = sha(json.dumps([source, steps[-1]["selector"], target], sort_keys=True).encode())
                 assignments[cid] = ({"job_id": key[:24], "candidate_id": cid, "kind": rows[cid]["type"],
+                    "canonical_core": bool(rows[cid].get("canonical_core", True)),
                     "reason": item["reason"], "risk": "read_only", "route": steps[:-1], "target": steps[-1],
                     "baseline_evidence": states[oid][1], "baseline_origins": stg["observations"][oid]["origins"],
                     "retry_no_feedback": rows[cid]["type"] == "no_reaction" and item.get("retry_no_feedback") is True}, "")
             except (KeyError, TypeError, ValueError, OSError) as exc:
                 assignments[cid] = (None, str(exc))
     jobs = [job for job, _ in assignments.values() if job is not None]
-    jobs.sort(key=lambda j: (PRIORITY[j["kind"]], len(j["route"]), j["job_id"], j["candidate_id"]))
+    jobs.sort(key=lambda j: (PRIORITY[j["kind"]], int(not j.get("canonical_core", True)), len(j["route"]), j["job_id"], j["candidate_id"]))
     accepted = []
     for job in jobs:
         cid, jid = job["candidate_id"], job["job_id"]
@@ -248,7 +270,7 @@ def main(argv=None):
         parser.add_argument(f"--{key}", type=Path, required=True)
     parser.add_argument("--review", type=Path)
     parser.add_argument("--environment", required=True)
-    parser.add_argument("--research-root", type=Path, default=Path(__file__).resolve().parents[2] / "research-explore")
+    parser.add_argument("--research-root", type=Path, default=_default_research_root())
     args = parser.parse_args(argv)
     sys.path.insert(0, str(args.research_root.resolve()))
     plan = compile_plan(args.stg, args.report, args.gaps, args.version_evidence, args.environment,

@@ -61,7 +61,7 @@ class MemoryGuidedPlanner:
             )}
             for index in range(start, len(actions)):
                 sc, ms = self.repair_clues.match_action(page.activity, actions[index])
-                if sc > 0:
+                if sc != 0:
                     clue_scores[index] = sc
                     clue_matches[index] = ms
         candidates = [{
@@ -77,7 +77,9 @@ class MemoryGuidedPlanner:
             "control_key": action.control_key, "effect_kind": action.effect_kind,
             "intent": action.intent, "relevant_state_keys": action.relevant_state_keys,
             **({"repair_clue_score": clue_scores[index], "repair_clue_matches": clue_matches[index]}
-               if index in clue_scores else {}),
+               if clue_scores.get(index, 0) > 0 else {}),
+            **({"repair_clue_avoid": True, "repair_clue_matches": clue_matches[index]}
+               if clue_scores.get(index, 0) < 0 else {}),
         } for index, action in enumerate(actions) if index >= start]
         record = {
             "phase": "select_action", "step": self.state.graph.completed_steps,

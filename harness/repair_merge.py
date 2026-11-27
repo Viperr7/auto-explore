@@ -137,11 +137,17 @@ def merge_repair(plan_path, run_dir, baseline_path, output):
     return receipt
 
 
+def _default_research_root() -> Path:
+    parent = Path(__file__).resolve().parents[2]
+    eval_branch = parent / "research-explore-eval-branch"
+    return eval_branch if eval_branch.is_dir() else parent / "research-explore"
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     for key in ("plan", "repair-run", "baseline", "output"):
         parser.add_argument(f"--{key}", required=True, type=Path)
-    parser.add_argument("--research-root", type=Path, default=Path(__file__).resolve().parents[2] / "research-explore")
+    parser.add_argument("--research-root", type=Path, default=_default_research_root())
     args = parser.parse_args(argv)
     sys.path.insert(0, str(args.research_root.resolve()))
     print(json.dumps(merge_repair(args.plan, args.repair_run, args.baseline, args.output), ensure_ascii=False))

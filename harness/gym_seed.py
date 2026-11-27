@@ -101,9 +101,11 @@ def load_seed_routes(path, package, *, max_depth):
         return _screen(activity, checked(name, "assets"))
 
     rejected = Counter()
+    folded_waits = 0
     report = {"source": str(root), "historical_graphs": len(manifest["graphs"]), "historical_pages": 0,
               "historical_edges": 0, "historical_tasks": 0, "candidate_routes": 0,
-              "candidate_steps": 0, "rejections": {}, "history_is_current_coverage": False}
+              "candidate_steps": 0, "folded_wait_edges": 0, "rejections": {},
+              "history_is_current_coverage": False}
     routes, seen = SeedRoutes(report), set()
     for item in manifest["graphs"]:
         if not isinstance(item, dict):
@@ -129,15 +131,46 @@ def load_seed_routes(path, package, *, max_depth):
                 continue
             source_id = task.get("start_page_id")
             steps = []
-            for edge_id in task.get("edge_ids", [])[:max_depth]:
+            for edge_id in task.get("edge_ids", []):
+                if max_depth <= 0:
+                    break
                 edge = edges.get(edge_id, {})
                 target_id = edge.get("to_page")
                 action = edge.get("action_details") or {}
+                action_type = action.get("action_type")
+                if len(steps) >= max_depth and action_type != "wait":
+                    break
+                if edge.get("success") is not True or edge.get("from_page") != source_id or not target_id:
+                    rejected["failed_or_disconnected_edge"] += 1
+                    break  # Only an uninterrupted, successful navigation prefix can be seeded.
+                if action_type == "wait":
+                    # Passive settle waits carry no user input; fold leading launch waits
+                    # and post-click settle waits while preserving strict live verification.
+                    if not steps:
+                        folded_waits += 1
+                        source_id = target_id
+                        continue
+                    source, target = pages.get(source_id, {}), pages.get(target_id, {})
+                    activities = [page.get("activity") or "" for page in (source, target)]
+                    shots = [edge.get(key) or page.get("screenshot_path") for key, page in
+                             (("before_screenshot", source), ("after_screenshot", target))]
+                    if not all(a.startswith(package + "/") for a in activities) or not all(shots):
+                        rejected["missing_or_external_evidence"] += 1
+                        break
+                    wait_before, wait_after = (image(a, s) for a, s in zip(activities, shots))
+                    if steps[-1].target != wait_before:
+                        rejected["discontinuous_screenshots"] += 1
+                        break
+                    if wait_after == steps[-1].source:
+                        rejected["self_loop"] += 1
+                        break
+                    steps[-1] = replace(steps[-1], target=wait_after)
+                    folded_waits += 1
+                    source_id = target_id
+                    continue
                 x, y = action.get("tap_x"), action.get("tap_y")
-                reason = ("failed_or_disconnected_edge" if edge.get("success") is not True
-                          or edge.get("from_page") != source_id or not target_id else
-                          "self_loop" if target_id == source_id else
-                          "unsupported_action" if action.get("action_type") != "click" else
+                reason = ("self_loop" if target_id == source_id else
+                          "unsupported_action" if action_type != "click" else
                           "invalid_coordinates" if type(x) is not int or type(y) is not int else "")
                 if reason:
                     rejected[reason] += 1
@@ -177,7 +210,8 @@ def load_seed_routes(path, package, *, max_depth):
             if steps and key not in seen:
                 seen.add(key)
                 routes.append(tuple(steps))
-    report.update(candidate_routes=len(routes), candidate_steps=sum(map(len, routes)), rejections=dict(rejected))
+    report.update(candidate_routes=len(routes), candidate_steps=sum(map(len, routes)),
+                  folded_wait_edges=folded_waits, rejections=dict(rejected))
     return routes
 
 
@@ -302,8 +336,23 @@ def bootstrap(runner, routes):
             "page_id": position.page.page_id if position else "",
             "work_id": position.work.work_id if position and position.work else "", **details})
 
+    clues = getattr(explorer, "repair_clues", None)
+    ordered_routes = list(routes)
+    prioritized_by_clues = False
+    if clues is not None and len(ordered_routes) > 1:
+        def _route_priority(route):
+            target_scores = [clues.activity_priority(step.target.activity) for step in route]
+            all_scores = target_scores + [clues.activity_priority(step.source.activity) for step in route]
+            return (max(target_scores, default=0), max(all_scores, default=0), sum(target_scores))
+        scored = [(_route_priority(r), idx, r) for idx, r in enumerate(ordered_routes)]
+        if any(score[0] > 0 or score[1] > 0 for score, _, _ in scored):
+            scored.sort(key=lambda item: (-item[0][0], -item[0][1], -item[0][2], item[1]))
+            ordered_routes = [item[2] for item in scored]
+            prioritized_by_clues = True
+    report["prioritized_by_clues"] = prioritized_by_clues
+
     # Bound restart attempts too, including prefixes rejected before their first tap.
-    for route in routes[:MAX_SEED_ACTIONS]:
+    for route in ordered_routes[:MAX_SEED_ACTIONS]:
         if budget <= 0:
             break
         report["attempted_routes"] += 1
@@ -379,13 +428,18 @@ def bootstrap(runner, routes):
                     if created:
                         page.action_sequence = list(after.path)
             before_image = after_image = ""
+            before_xml = after_xml = ""
             if runner.config.save_screenshots:
                 before_image, after_image = explorer._save_transition_screens(fresh, after_capture)
+                save_xml = getattr(explorer, "_save_transition_hierarchies", None)
+                if callable(save_xml):
+                    before_xml, after_xml = save_xml(fresh, after_capture, before_image, after_image)
             observation = runner.state.record_transition(
                 from_page=before.page.page_id, to_page=after.page.page_id if after else "",
                 action=action, success=success, destination_verified=after is not None,
                 state_changed=bool(after and behavioral_changes(before.guard, after.guard)),
                 before_screenshot=before_image, after_screenshot=after_image,
+                before_hierarchy_path=before_xml, after_hierarchy_path=after_xml,
                 before_fingerprint=fresh.screenshot_hash, after_fingerprint=after_capture.screenshot_hash,
                 from_state_id=before.visual.state_id, to_state_id=after.visual.state_id if after else "",
                 from_work_id=before.work.work_id,

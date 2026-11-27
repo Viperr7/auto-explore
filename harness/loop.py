@@ -185,8 +185,8 @@ class AndroidExplorer:
                         self.graph.termination_reason = "blocked"
                         break
 
-                # 4.1 按先进先出顺序取出页面，并记录本轮实际探索顺序。
-                page_id = self._pending_pages.popleft()
+                # 4.1 有评估补采线索时按线索优先队列选取最有价值页面；否则按 FIFO 取出。
+                page_id = self._pop_next_pending_page()
                 page_state = self.graph.pages[page_id]
                 self.graph.exploration_order.append(page_id)
 
@@ -323,6 +323,7 @@ class AndroidExplorer:
             state_changed = visual_changed = False
             after_capture = before_capture
             before_path = after_path = ""
+            before_xml = after_xml = ""
             recovery = "not_attempted"
             error_stage = error = ""
             next_page: Optional[PageState] = None
@@ -346,6 +347,9 @@ class AndroidExplorer:
                     after_path = ""
                 else:
                     visual_changed = not self.verifier.captures_are_visually_same(after_capture, before_capture)
+                before_xml, after_xml = self._save_transition_hierarchies(
+                    before_capture, after_capture, before_path, after_path,
+                )
                 if executed and observation_valid:
                     error_stage = "identification"
                     activity = self.controller.get_current_activity()
@@ -382,11 +386,15 @@ class AndroidExplorer:
                 if not before_path and self.config.save_screenshots:
                     before_path, saved_after = self._save_transition_screens(before_capture, after_capture)
                     after_path = saved_after if observation_valid else ""
+                    before_xml, after_xml = self._save_transition_hierarchies(
+                        before_capture, after_capture, before_path, after_path,
+                    )
                 self._record_transition(
                     from_page=page_state.page_id,
                     to_page=next_page.page_id if next_page is not None else "",
                     action=action, success=executed, state_changed=state_changed,
                     before_screenshot=before_path, after_screenshot=after_path, recovery=recovery,
+                    before_hierarchy_path=before_xml, after_hierarchy_path=after_xml,
                     observation_valid=observation_valid, destination_verified=next_page is not None,
                     visual_changed=visual_changed, error_stage=error_stage, error=error,
                     outside_app=outside_app, source_snapshot=source_snapshot,
@@ -470,6 +478,10 @@ class AndroidExplorer:
         source_action: Optional[ExplorationAction] = None,
     ) -> Tuple[Optional[PageState], bool]:
         activity = self.controller.get_current_activity()
+        if "LogAccessDialogActivity" in str(activity or ""):
+            self.controller.go_back()
+            capture = self._capture_screen()
+            activity = self.controller.get_current_activity()
         if not self._is_target_activity(activity):
             print(f"  检测到目标 App 之外的 Activity，跳过入队并触发恢复: {activity}")
             return None, False
@@ -511,6 +523,7 @@ class AndroidExplorer:
 
         page_id = self.state.allocate_page_id()
         screenshot_path = self.state.save_page_screenshot(page_id, capture)
+        hierarchy_path = self.state.save_page_hierarchy(page_id, capture)
         if analysis is None:
             print(f"  VLM 分析新页面 {page_id}...")
             analysis = self._analyze_screen(capture, action_sequence, activity)
@@ -536,6 +549,7 @@ class AndroidExplorer:
         page_state = PageState(
             page_id=page_id,
             screenshot_path=screenshot_path,
+            hierarchy_path=hierarchy_path,
             screenshot_hash=capture.screenshot_hash,
             activity=activity,
             page_type=str(analysis.get("page_type") or "unknown"),
@@ -555,6 +569,23 @@ class AndroidExplorer:
             content_inventory=analysis["content_inventory"],
         )
         self.state.register_page(page_state, capture)
+        if self.repair_clues is not None and callable(getattr(self.repair_clues, "mark_observed", None)):
+            newly_hit = self.repair_clues.mark_observed(
+                page_state.activity,
+                page_description=page_state.page_description,
+                content_hints=page_state.content_hints,
+            )
+            if newly_hit:
+                self.state.append_observation({
+                    "kind": "repair_clue_hit",
+                    "page_id": page_state.page_id,
+                    "activity": page_state.activity,
+                    "targets": newly_hit,
+                    "progress": self.repair_clues.progress(),
+                })
+                titles = ", ".join(t.get("title", "") for t in newly_hit)
+                prog = self.repair_clues.progress()
+                print(f"  [Repair Clue HIT] {page_state.page_id} 命中缺失核心模板: {titles} ({prog['hit_in_run']}/{prog['total_missing_targets']})")
         return page_state, True
 
     def _analyze_screen(self, capture: ScreenCapture, action_sequence: List[ActionSequenceStep],
@@ -577,6 +608,18 @@ class AndroidExplorer:
                 self.graph, query=semantic.description, activity=activity, action_sequence=action_sequence,
                 purpose="analyze",
             )
+        if self.repair_clues is not None and (callable(analyze) or history is not None):
+            guidance_text = (
+                self.repair_clues.screen_analysis_guidance(activity)
+                if callable(getattr(self.repair_clues, "screen_analysis_guidance", None))
+                else ""
+            )
+            clue_ctx = self.repair_clues.prompt_context(activity)
+            context = {
+                **(context or {}),
+                "repair_clues": clue_ctx,
+                **({"repair_clues_guidance": guidance_text} if guidance_text else {}),
+            }
         if history is not None:
             analysis = analyze_history(capture.image_b64, capture.screen_size,
                                        reference=history.reference, history=history.evidence, memory=context)
@@ -654,7 +697,57 @@ class AndroidExplorer:
             self.state.note_visit(target_page.page_id)
         return capture
 
+    def _pop_next_pending_page(self) -> str:
+        """Select next pending BFS page: clue-priority queue when repair_clues is active, else FIFO."""
+        if self.repair_clues is None or len(self._pending_pages) <= 1:
+            return self._pending_pages.popleft()
+        page_prio_fn = getattr(self.repair_clues, "page_priority", None)
+        if not callable(page_prio_fn):
+            return self._pending_pages.popleft()
+        best_idx = 0
+        best_key = None
+        for idx, pid in enumerate(self._pending_pages):
+            pg = self.graph.pages.get(pid)
+            if pg is None:
+                continue
+            remaining = pg.planned_actions[pg.next_action_index:]
+            prio = page_prio_fn(pg.activity, remaining, len(pg.action_sequence))
+            key = (prio, -idx)
+            if best_key is None or key > best_key:
+                best_key = key
+                best_idx = idx
+        chosen = self._pending_pages[best_idx]
+        del self._pending_pages[best_idx]
+        return chosen
+
     def _select_actions(self, page_state: PageState) -> List[ExplorationAction]:
+        if self.repair_clues is not None and page_state.next_action_index == 0 and len(page_state.planned_actions) > 1:
+            capture = self._page_images.get(page_state.page_id)
+            if isinstance(capture, tuple) and len(capture) >= 2 and isinstance(capture[1], (tuple, list)) and len(capture[1]) >= 2:
+                screen_h = int(capture[1][1] or 0)
+            elif hasattr(capture, "screen_size") and capture.screen_size:
+                screen_h = int(capture.screen_size[1] or 0)
+            else:
+                screen_h = 0
+            def _action_rank(pair: Tuple[int, ExplorationAction]) -> Tuple[int, int, int]:
+                idx, act = pair
+                sc, _ = self.repair_clues.match_action(page_state.activity, act)
+                b = act.bounds or {}
+                is_bottom_tab = bool(
+                    act.element_type == "tab"
+                    or (screen_h > 0 and isinstance(b.get("y"), (int, float)) and b["y"] >= 0.85 * screen_h)
+                )
+                if sc > 0:
+                    tier = 0
+                elif is_bottom_tab:
+                    tier = 1
+                elif sc == 0:
+                    tier = 2
+                else:
+                    tier = 3  # negative score: already covered in baseline avoid-list
+                return (tier, -sc, idx)
+            ranked = [act for _, act in sorted(enumerate(page_state.planned_actions), key=_action_rank)]
+            page_state.planned_actions = ranked
         actions = list(page_state.planned_actions)
         if self.config.max_actions_per_page > 0:
             return actions[: self.config.max_actions_per_page]
@@ -669,6 +762,17 @@ class AndroidExplorer:
         after_capture: ScreenCapture,
     ) -> Tuple[str, str]:
         return self.state.save_transition_screens(before_capture, after_capture)
+
+    def _save_transition_hierarchies(
+        self,
+        before_capture: ScreenCapture,
+        after_capture: ScreenCapture,
+        before_screenshot: str,
+        after_screenshot: str,
+    ) -> Tuple[str, str]:
+        return self.state.save_transition_hierarchies(
+            before_capture, after_capture, before_screenshot, after_screenshot,
+        )
 
     def _save_graph(self, *, announce: bool = True) -> None:
         self.state.save_graph(announce=announce)

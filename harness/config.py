@@ -74,6 +74,7 @@ class ExplorerConfig:
     summary_budget_seconds: float = 120.0
     summary_max_chars: int = 12000
     screenshot_delay: float = 10.0
+    launch_delay: float = _float_env("APP_LAUNCH_DELAY", default=2.0)
     replay_attempts: int = 2
     back_after_action: bool = True
 

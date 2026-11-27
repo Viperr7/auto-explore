@@ -516,3 +516,124 @@ def test_cli_exposes_seed_verification_modes():
     parser = cli.build_parser()
     args = parser.parse_args(["--device", "127.0.0.1:5555", "--package", PACKAGE, "--summary-model", "", "--gym-seed-verification", "exact"])
     assert cli.config_from_args(args, parser).gym_seed_verification == "exact"
+
+
+def test_seed_folds_leading_launch_wait_including_external_splash(seed):
+    from harness.gym_seed import load_seed_routes
+
+    Image.new("RGB", (100, 100), "black").save(seed / "assets/launcher.png")
+    manifest_path = seed / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"]["assets/launcher.png"] = sha256((seed / "assets/launcher.png").read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    def change(graph):
+        graph["pages"]["launcher"] = {
+            "activity": "com.android.launcher/.Launcher",
+            "screenshot_path": "assets/launcher.png",
+        }
+        graph["transitions"].insert(0, {
+            "edge_id": "edge_wait",
+            "from_page": "launcher",
+            "to_page": "root",
+            "success": True,
+            "action_details": {"action_type": "wait"},
+        })
+        graph["task_runs"][0]["start_page_id"] = "launcher"
+        graph["task_runs"][0]["edge_ids"] = ["edge_wait", "edge_0"]
+
+    update_seed(seed, change)
+    routes = load_seed_routes(seed, PACKAGE, max_depth=1)
+    assert len(routes) == 1
+    assert len(routes[0]) == 1
+    assert routes[0][0].edge == "edge_0"
+    assert routes[0][0].source.activity == f"{PACKAGE}/{PACKAGE}.Main"
+    assert routes.report["folded_wait_edges"] == 1
+
+
+def test_seed_folds_post_click_settle_wait_and_preserves_continuity(seed):
+    from harness.gym_seed import load_seed_routes
+
+    for name, color in (("loading", "yellow"), ("sub", "purple")):
+        path = seed / "assets" / f"{name}.png"
+        Image.new("RGB", (100, 100), color).save(path)
+    manifest_path = seed / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for name in ("loading", "sub"):
+        p = seed / "assets" / f"{name}.png"
+        manifest["files"][f"assets/{name}.png"] = sha256(p.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    def change(graph):
+        graph["pages"]["loading"] = {"activity": ACTIVITY, "screenshot_path": "assets/loading.png"}
+        graph["pages"]["sub"] = {"activity": PACKAGE + "/.Sub", "screenshot_path": "assets/sub.png"}
+        graph["transitions"] = [
+            {"edge_id": "edge_0", "from_page": "root", "to_page": "loading", "success": True,
+             "action_details": {"action_type": "click", "tap_x": 40, "tap_y": 40}},
+            {"edge_id": "edge_wait", "from_page": "loading", "to_page": "detail", "success": True,
+             "action_details": {"action_type": "wait"}},
+            {"edge_id": "edge_1", "from_page": "detail", "to_page": "sub", "success": True,
+             "action_details": {"action_type": "click", "tap_x": 50, "tap_y": 50}},
+        ]
+        graph["task_runs"][0]["edge_ids"] = ["edge_0", "edge_wait", "edge_1"]
+
+    update_seed(seed, change)
+    routes = load_seed_routes(seed, PACKAGE, max_depth=2)
+    assert len(routes) == 1
+    assert [s.edge for s in routes[0]] == ["edge_0", "edge_1"]
+    assert routes[0][0].target == routes[0][1].source
+    assert routes.report["folded_wait_edges"] == 1
+
+
+def test_bootstrap_prioritizes_seed_routes_matching_repair_clues(seed, tmp_path):
+    from harness.gym_seed import bootstrap, load_seed_routes
+    from harness.repair_clues import RepairClues
+
+    path = seed / "assets/settings.png"
+    Image.new("RGB", (100, 100), "purple").save(path)
+    manifest_path = seed / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"]["assets/settings.png"] = sha256(path.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    def change(graph):
+        graph["pages"]["settings"] = {"activity": PACKAGE + "/.Settings", "screenshot_path": "assets/settings.png"}
+        graph["transitions"].append({
+            "edge_id": "edge_1", "from_page": "root", "to_page": "settings", "success": True,
+            "action_details": {"action_type": "click", "tap_x": 60, "tap_y": 60},
+        })
+        graph["task_runs"].append({
+            "task_id": "t2", "reset_policy": "restart", "start_page_id": "root", "edge_ids": ["edge_1"],
+        })
+
+    update_seed(seed, change)
+    routes = load_seed_routes(seed, PACKAGE, max_depth=3)
+    assert [r[0].edge for r in routes] == ["edge_0", "edge_1"]
+
+    clues = RepairClues({
+        "format": "stg_eval_repair_clues", "schema_version": 1, "package": PACKAGE,
+        "prioritized_activities": [{"activity": PACKAGE + "/.Settings", "score": 25}],
+        "targets": [],
+    }, tmp_path / "clues.json")
+    tried_edges = []
+    wrong = capture(b"\x89PNG\r\n\x1a\n" + (seed / "assets/settings.png").read_bytes()[8:])
+
+    def log(obs):
+        if obs.get("event") == "gym_seed":
+            tried_edges.append(obs["edge"])
+
+    runner = SimpleNamespace(
+        config=SimpleNamespace(max_steps=4, save_screenshots=False, gym_seed_verification="exact"),
+        graph=SimpleNamespace(completed_steps=0),
+        current=None,
+        state=SimpleNamespace(append_observation=log),
+        explorer=SimpleNamespace(
+            repair_clues=clues,
+            controller=SimpleNamespace(restart_app=lambda: None, get_current_activity=lambda: ACTIVITY),
+            _capture_screen=lambda: wrong,
+            _capture_or_get_page=lambda *_: (None, False),
+        ),
+    )
+    bootstrap(runner, routes)
+    assert tried_edges == ["edge_1", "edge_0"]
+    assert runner.graph.seed_handoff["prioritized_by_clues"] is True

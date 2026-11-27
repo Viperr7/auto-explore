@@ -256,6 +256,13 @@ class ExplorationState:
         Path(screenshot_path).write_bytes(base64.b64decode(capture.image_b64))
         return screenshot_path
 
+    def save_page_hierarchy(self, page_id: str, capture: ScreenCapture) -> str:
+        if not self.config.save_screenshots or not getattr(capture, "hierarchy_xml", ""):
+            return ""
+        hierarchy_path = self.run_dir / f"{page_id}.xml"
+        hierarchy_path.write_text(capture.hierarchy_xml, encoding="utf-8")
+        return str(hierarchy_path)
+
     def save_analysis(self, page_id: str, analysis: dict) -> None:
         if not self.config.save_analysis:
             return
@@ -281,6 +288,7 @@ class ExplorationState:
             page, capture, semantic_state=page.semantic_state,
             page_description=page.page_description, activity=page.activity,
             action_sequence=page.action_sequence, screenshot_path=page.screenshot_path,
+            hierarchy_path=page.hierarchy_path,
             observed_at=page.timestamp,
         )
         page.representative_state_id = initial.state_id
@@ -289,6 +297,7 @@ class ExplorationState:
         self, page: PageState, capture: ScreenCapture, *,
         semantic_state: dict, page_description: str, activity: str,
         action_sequence: list[ActionSequenceStep], screenshot_path: str = "",
+        hierarchy_path: str = "",
         observed_at: float | None = None,
         actionable_signature: str = "",
         behavioral_state: dict | None = None, context: dict | None = None,
@@ -339,6 +348,7 @@ class ExplorationState:
         state = PageVisualState(
             state_id=state_id,
             screenshot_path=screenshot_path or self.save_page_screenshot(state_id, capture),
+            hierarchy_path=hierarchy_path or self.save_page_hierarchy(state_id, capture),
             screenshot_hash=capture.screenshot_hash,
             activity=activity, page_description=page_description,
             semantic_state=deepcopy(semantic_state), action_sequence=deepcopy(action_sequence),
@@ -402,6 +412,28 @@ class ExplorationState:
         Path(after_path).write_bytes(base64.b64decode(after_capture.image_b64))
         return before_path, after_path
 
+    def save_transition_hierarchies(
+        self,
+        before_capture: ScreenCapture,
+        after_capture: ScreenCapture,
+        before_screenshot: str,
+        after_screenshot: str,
+    ) -> Tuple[str, str]:
+        before_xml = after_xml = ""
+        if not self.config.save_screenshots:
+            return "", ""
+        if before_screenshot and getattr(before_capture, "hierarchy_xml", ""):
+            p = Path(before_screenshot).with_suffix(".xml")
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(before_capture.hierarchy_xml, encoding="utf-8")
+            before_xml = str(p)
+        if after_screenshot and getattr(after_capture, "hierarchy_xml", ""):
+            p = Path(after_screenshot).with_suffix(".xml")
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(after_capture.hierarchy_xml, encoding="utf-8")
+            after_xml = str(p)
+        return before_xml, after_xml
+
     def record_transition(
         self,
         *,
@@ -413,6 +445,8 @@ class ExplorationState:
         before_screenshot: str,
         after_screenshot: str,
         recovery: str,
+        before_hierarchy_path: str = "",
+        after_hierarchy_path: str = "",
         observation_valid: bool = True,
         destination_verified: bool | None = None,
         visual_changed: bool | None = None,
@@ -496,6 +530,7 @@ class ExplorationState:
             "visual_changed": visual_changed, "recovery": recovery,
             "error_stage": error_stage, "error": error,
             "before_screenshot": before_screenshot, "after_screenshot": after_screenshot,
+            "before_hierarchy_path": before_hierarchy_path, "after_hierarchy_path": after_hierarchy_path,
             "before_fingerprint": before_fingerprint, "after_fingerprint": after_fingerprint,
             "verification_of": action.verification_of,
             "timestamp": observed_at if observed_at is not None else time.time(),
@@ -512,6 +547,7 @@ class ExplorationState:
         tap_y = None
         if action.bounds.get("width", 0) > 0 and action.bounds.get("height", 0) > 0:
             tap_x, tap_y = ActionCodec.tap_point_for_bounds(action.bounds)
+        edge_id = f"edge_{len(self.graph.transitions):05d}"
         self.graph.transitions.append(
             Transition(
                 from_page=from_page,
@@ -531,6 +567,10 @@ class ExplorationState:
                 destination_verified=destination_verified,
                 from_state_id=from_state_id, to_state_id=to_state_id,
                 from_work_id=from_work_id, to_work_id=to_work_id, purpose=purpose,
+                edge_id=edge_id,
+                before_hierarchy_path=before_hierarchy_path,
+                after_hierarchy_path=after_hierarchy_path,
+                visual_changed=visual_changed,
             )
         )
         return observation
@@ -577,6 +617,17 @@ class ExplorationState:
 
     def experiences(self) -> list[dict]:
         return derive_experiences(self.historical_observations + self.graph.observations)
+
+    @staticmethod
+    def _serialize_transition(transition: Transition, index: int) -> dict:
+        row = asdict(transition)
+        if not row.get("edge_id"):
+            row["edge_id"] = row.get("observation_id") or f"edge_{index:05d}"
+        details = row.get("action_details")
+        if isinstance(details, dict) and transition.tap_x is not None and transition.tap_y is not None:
+            details.setdefault("tap_x", transition.tap_x)
+            details.setdefault("tap_y", transition.tap_y)
+        return row
 
     def save_graph(self, *, announce: bool = True) -> None:
         output_path = Path(self.config.output_dir) / "app_graph.json"
@@ -633,6 +684,7 @@ class ExplorationState:
                 page_id: {
                     "page_id": page.page_id,
                     "screenshot_path": page.screenshot_path,
+                    "hierarchy_path": page.hierarchy_path,
                     "screenshot_hash": page.screenshot_hash,
                     "activity": page.activity,
                     "page_type": page.page_type,
@@ -663,7 +715,10 @@ class ExplorationState:
                 }
                 for page_id, page in self.graph.pages.items()
             },
-            "transitions": [asdict(transition) for transition in self.graph.transitions],
+            "transitions": [
+                self._serialize_transition(transition, index)
+                for index, transition in enumerate(self.graph.transitions)
+            ],
             "state_transition_triplets": [
                 {
                     "before_screenshot": transition.before_screenshot,
